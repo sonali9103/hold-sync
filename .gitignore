@@ -1,0 +1,10 @@
+.hold-sync-watermark.json
+.hold-sync-watermark.json.*.tmp
+.hold-sync-watermark.copia.json
+.hold-sync-watermark.copia.json.*.tmp
+.env
+node_modules/
+venv/
+bin/
+obj/
+.vs/

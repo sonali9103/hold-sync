@@ -1,0 +1,21 @@
+{
+  "name": "sapphire-hold-sync",
+  "version": "0.1.0",
+  "description": "Manual-run v1: syncs Sapphire U_DDIHOLDLIST holds into Salesforce Cases + sub-tickets",
+  "main": "dist/sync.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/sync.js",
+    "test:hold": "ts-node scripts/test-single-hold.ts"
+  },
+  "dependencies": {
+    "jsforce": "^3.4.0",
+    "dotenv": "^16.4.0",
+    "pino": "^9.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.14.0"
+  }
+}
