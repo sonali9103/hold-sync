@@ -45,7 +45,8 @@ export function transformHolds(
       holdSource: 'Sapphire',
       patientId: contactInfo?.patientId ?? null,
       holdType: canonicalHoldType(row.U_HOLDCODEID, row.U_HOLDCODE),
-      notes: row.NOTES,
+      // Hold-level NOTES was populated in 0 of 840 sampled real holds over 30 days; CS commentary lives in SUBMISSION.NOTES.
+      notes: row.submissionNotes,
       sourceTool: row.CREATETOOL,
       createdBy: row.CREATEBY,
       createdDate: row.CREATEDT,

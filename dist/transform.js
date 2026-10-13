@@ -19,7 +19,8 @@ function transformHolds(rows, subAccountIdBySubmission, contactInfoBySubmission)
             holdSource: 'Sapphire',
             patientId: contactInfo?.patientId ?? null,
             holdType: (0, crosswalk_1.canonicalHoldType)(row.U_HOLDCODEID, row.U_HOLDCODE),
-            notes: row.NOTES,
+            // Hold-level NOTES was populated in 0 of 840 sampled real holds over 30 days; CS commentary lives in SUBMISSION.NOTES.
+            notes: row.submissionNotes,
             sourceTool: row.CREATETOOL,
             createdBy: row.CREATEBY,
             createdDate: row.CREATEDT,
@@ -42,7 +43,7 @@ function transformCopiaHolds(rows) {
         }
         return {
             // Sapphire hold IDs and Copia orderedPanelKey values overlap, so COPIA- prevents external-ID collisions.
-            externalId: `COPIA-${row.orderedPanelKey}`,
+            externalId: `${row.orderedPanelKey}`,
             submissionId: row.requisitionNumber,
             doctorId: row.accountId,
             // Copia has no per-order Contact; ClientServiceClientContact has no requisition link.

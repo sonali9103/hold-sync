@@ -48,6 +48,7 @@ class OracleHoldClient {
             U_HOLDCODE: row.U_HOLDCODE,
             U_HOLDCODEID: row.U_HOLDCODEID,
             NOTES: row.NOTES,
+            submissionNotes: row.SubmissionNotes,
             CREATEDT: new Date(row.CREATEDT),
             CREATEBY: row.CREATEBY,
             CREATETOOL: row.CREATETOOL,

@@ -12,6 +12,7 @@ export interface HoldRow {
     U_HOLDCODE: string;
     U_HOLDCODEID: number;
     NOTES: string | null;
+    submissionNotes: string | null;
     CREATEDT: Date;
     CREATEBY: string;
     CREATETOOL: string;
@@ -48,6 +49,7 @@ interface ApiHoldRow {
     U_HOLDCODE: string;
     U_HOLDCODEID: number;
     NOTES: string | null;
+    SubmissionNotes: string | null;
     CREATEDT: string | null;
     CREATEBY: string | null;
     CREATETOOL: string | null;
@@ -136,6 +138,7 @@ export class OracleHoldClient {
             U_HOLDCODE: row.U_HOLDCODE,
             U_HOLDCODEID: row.U_HOLDCODEID,
             NOTES: row.NOTES,
+            submissionNotes: row.SubmissionNotes,
             CREATEDT: new Date(row.CREATEDT as string),
             CREATEBY: row.CREATEBY as string,
             CREATETOOL: row.CREATETOOL as string,
