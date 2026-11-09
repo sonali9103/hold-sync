@@ -4,7 +4,7 @@ import { formatUtcWatermarkDate, formatWatermarkDate } from '../watermark';
 
 // Update these to match whatever API names you created in Setup.
 const CASE_OBJECT = 'Case';
-const CASE_EXTERNAL_ID_FIELD = 'Sapphire_Hold_Id__c';
+const CASE_EXTERNAL_ID_FIELD = 'Sapphire_Hold_ID__c';
 const CASE_RECORD_TYPE_NAME = 'CS Ticket';
 const RELEASE_STATUSES = ['Resolved'] as const;
 
@@ -170,7 +170,7 @@ export class SalesforceHoldClient {
         interface ReleaseCaseRecord {
             Id: string;
             CaseNumber: string;
-            Sapphire_Hold_Id__c: string;
+            Sapphire_Hold_ID__c: string;
         }
 
         const records: ReleaseCaseRecord[] = [];
@@ -187,7 +187,7 @@ export class SalesforceHoldClient {
         return records.map((record) => ({
             caseId: record.Id,
             caseNumber: record.CaseNumber,
-            holdId: record.Sapphire_Hold_Id__c,
+            holdId: record.Sapphire_Hold_ID__c,
         }));
     }
 
