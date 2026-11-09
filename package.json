@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/sync.js",
+    "release-sync": "node dist/release-sync.js",
     "test:hold": "ts-node scripts/test-single-hold.ts"
   },
   "dependencies": {

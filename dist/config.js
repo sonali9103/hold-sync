@@ -34,6 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getConfig = getConfig;
+exports.getReleaseConfig = getReleaseConfig;
 const dotenv = __importStar(require("dotenv"));
 dotenv.config();
 function required(name) {
@@ -63,5 +64,16 @@ function getConfig() {
             // one-line config change, not a redesign.
             defaultOwnerUsername: required('SF_DEFAULT_OWNER_USERNAME'),
         },
+    };
+}
+function getReleaseConfig() {
+    // temporary single releaser name until a per-user Salesforce -> Sapphire mapping file exists
+    const releasedBy = required('SAPPHIRE_RELEASED_BY').trim();
+    if (!releasedBy || releasedBy.length > 20) {
+        throw new Error('SAPPHIRE_RELEASED_BY must be between 1 and 20 characters after trimming.');
+    }
+    return {
+        sapphireWriteConnectName: required('SAPPHIRE_WRITE_CONNECT_NAME'),
+        releasedBy: releasedBy.toLowerCase(),
     };
 }

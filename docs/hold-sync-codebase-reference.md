@@ -10,7 +10,7 @@ Living reference of what every file in `hold-sync/` does and why it's built the 
 
 | File | Purpose | Notes |
 |---|---|---|
-| `package.json` | Declares dependencies and `npm run` shortcuts (`test:hold`, `check:oracle`, `import:file`) | `pino` is installed but currently unused anywhere in the code — all logging is plain `console.log`/`console.warn`. Either wire it in or drop the dependency. |
+| `package.json` | Declares dependencies and `npm run` shortcuts (`test:hold`, `check:oracle`, `import:file`, `release-sync`) | `pino` is installed but currently unused anywhere in the code — all logging is plain `console.log`/`console.warn`. Either wire it in or drop the dependency. |
 | `tsconfig.json` | TypeScript config — compiles `src/**/*` into `dist/` | `scripts/` is outside `rootDir`, so `npm run build` never touches it. `strict: true` is on, which matters given how much of this codebase deals with nullable Oracle fields. |
 | `.env.example` | Template for the real (uncommitted) `.env` | Documents required vars: DDIVbNetApis connection info, Salesforce login URL/username/password/token, default owner username. |
 
@@ -39,6 +39,17 @@ Living reference of what every file in `hold-sync/` does and why it's built the 
   sinceDate: string; // 'DD-MON-YYYY', defaults to '01-JAN-2020'
 }
 ```
+
+**Shape returned by `getReleaseConfig()`** (validated only by `release-sync.ts`):
+```ts
+{
+  sapphireWriteConnectName: string; // SAPPHIRE_WRITE_CONNECT_NAME; required, no default
+  releasedBy: string;               // SAPPHIRE_RELEASED_BY; trimmed, lowercased, max 20 chars
+}
+```
+
+Environment variables read by the application are `DDI_API_BASE_URL`, `ORACLE_CONNECT_NAME`, `COPIA_CONNECT_NAME`, `SF_LOGIN_URL`, `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN`, `SF_DEFAULT_OWNER_USERNAME`, `SAPPHIRE_WRITE_CONNECT_NAME`, and `SAPPHIRE_RELEASED_BY`.
+
 | `crosswalk.ts` | Static `U_HOLDCODEID → canonical Hold Type text` lookup (35 CS codes; Billing's 4 — IDs 1, 25, 41, 45 — deliberately excluded) | Pure data + one function (`canonicalHoldType`), no I/O or side effects. Mapping is done by numeric ID, not text, since hold-code text has been confirmed unreliable (typos, drift) while the ID is stable. |
 
 **Shapes defined:**
@@ -80,12 +91,14 @@ function transformHolds(
 ): HoldTicketRecord[];
 ```
 | `sync.ts` | Reads Sapphire data through DDIVbNetApis, fetches changed holds, loads submission-level lookup data, maps each changed hold to one ticket, then upserts one Case per ticket | Subaccount and doctor/patient calls remain batched by distinct submission ID. The old per-submission sibling reload is gone because no Case-level aggregate exists. |
+| `release-sync.ts` | Dry-run-by-default Salesforce → Sapphire hold release command | Requires `--only-hold-ids`; `--apply` enables Sapphire writes and per-result Salesforce release markers. Processes Sapphire requests in chunks of 25 and stops after a request-level failure. |
 
 ### `src/services/` — external system clients
 
 | File | Purpose | Notes |
 |---|---|---|
 | `oracle-client.ts` | `OracleHoldClient` — reads Sapphire data through the DDIVbNetApis REST API | `fetchChangedHolds()` returns the exact holds to sync. `fetchSubmissionSubAccountIds()` and `fetchSubmissionContactInfo()` enrich them by distinct submission ID. `fetchHoldsBySubmissionId()` supports submission-level testing. `fetchHoldById()` is unavailable until DDIVbNetApis adds a matching endpoint. Patient DOB and SSN are deliberately never returned. |
+| `sapphire-release-client.ts` | `SapphireReleaseClient` — isolated Sapphire write path for releasing holds | Calls `Sapphire_ReleaseHolds` with a 60-second timeout, no retries, and chunks of at most 25. Request-level errors stop the run; per-hold outcomes remain typed results. |
 
 **Shapes defined:**
 ```ts
@@ -149,6 +162,8 @@ class SalesforceHoldClient {
     defaultOwnerUsername: string;
   });
   login(): Promise<void>;
+  getResolvedCasesPendingRelease(onlyHoldIds?: string[]): Promise<ResolvedCasePendingRelease[]>;
+  recordReleaseResult(caseId: string, synced: boolean, note: string | null): Promise<void>;
   upsertTicket(ticket: HoldTicketRecord): Promise<void>;
 }
 
@@ -168,6 +183,14 @@ class SalesforceHoldClient {
   Doctor_Phone__c: string | null;
   Patient_Name__c: string | null;
   Patient_Phone__c: string | null;
+}
+```
+
+Release write-back updates only these Case fields:
+```ts
+{
+  Source_Release_Synced__c: boolean;
+  Source_Release_Note__c: string | null; // truncated to 255 characters
 }
 ```
 

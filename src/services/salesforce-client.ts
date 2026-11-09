@@ -6,6 +6,13 @@ import { formatUtcWatermarkDate, formatWatermarkDate } from '../watermark';
 const CASE_OBJECT = 'Case';
 const CASE_EXTERNAL_ID_FIELD = 'Sapphire_Hold_Id__c';
 const CASE_RECORD_TYPE_NAME = 'CS Ticket';
+const RELEASE_STATUSES = ['Resolved'] as const;
+
+export interface ResolvedCasePendingRelease {
+    caseId: string;
+    caseNumber: string;
+    holdId: string;
+}
 
 export class SalesforceHoldClient {
     private conn: jsforce.Connection;
@@ -128,6 +135,75 @@ export class SalesforceHoldClient {
         return source === 'copia'
             ? formatUtcWatermarkDate(date)
             : formatWatermarkDate(date);
+    }
+
+    async getResolvedCasesPendingRelease(
+        onlyHoldIds?: string[]
+    ): Promise<ResolvedCasePendingRelease[]> {
+        if (!this.defaultOwnerId || !this.caseRecordTypeId) {
+            throw new Error(
+                'Not logged in â€” call login() before getResolvedCasesPendingRelease()'
+            );
+        }
+
+        if (onlyHoldIds?.length === 0) return [];
+        for (const holdId of onlyHoldIds ?? []) {
+            if (!/^[0-9]+$/.test(holdId)) {
+                throw new Error(`Invalid Sapphire hold ID: ${holdId}`);
+            }
+        }
+
+        const statuses = RELEASE_STATUSES.map((status) => `'${status}'`).join(', ');
+        const holdIdFilter = onlyHoldIds
+            ? `\n             AND ${CASE_EXTERNAL_ID_FIELD} IN (${onlyHoldIds
+                .map((holdId) => `'${holdId}'`)
+                .join(', ')})`
+            : '';
+        const soql =
+            `SELECT Id, CaseNumber, ${CASE_EXTERNAL_ID_FIELD}\n` +
+            `             FROM ${CASE_OBJECT}\n` +
+            `             WHERE Status IN (${statuses})\n` +
+            `             AND Hold_Source__c = 'Sapphire'\n` +
+            `             AND ${CASE_EXTERNAL_ID_FIELD} != null\n` +
+            `             AND Source_Release_Synced__c = false${holdIdFilter}`;
+
+        interface ReleaseCaseRecord {
+            Id: string;
+            CaseNumber: string;
+            Sapphire_Hold_Id__c: string;
+        }
+
+        const records: ReleaseCaseRecord[] = [];
+        let page = await this.conn.query<ReleaseCaseRecord>(soql);
+        records.push(...page.records);
+        while (!page.done) {
+            if (!page.nextRecordsUrl) {
+                throw new Error('Salesforce release query was incomplete without a next page URL.');
+            }
+            page = await this.conn.queryMore<ReleaseCaseRecord>(page.nextRecordsUrl);
+            records.push(...page.records);
+        }
+
+        return records.map((record) => ({
+            caseId: record.Id,
+            caseNumber: record.CaseNumber,
+            holdId: record.Sapphire_Hold_Id__c,
+        }));
+    }
+
+    async recordReleaseResult(
+        caseId: string,
+        synced: boolean,
+        note: string | null
+    ): Promise<void> {
+        const result = await this.conn.sobject(CASE_OBJECT).update({
+            Id: caseId,
+            Source_Release_Synced__c: synced,
+            Source_Release_Note__c: note === null ? null : note.slice(0, 255),
+        });
+        if (!result.success) {
+            throw new Error(`Could not record Sapphire release result for Case ${caseId}`);
+        }
     }
 
     /** Upserts one standalone Case for one Sapphire hold. */

@@ -30,3 +30,18 @@ export function getConfig() {
         },
     };
 }
+
+export function getReleaseConfig() {
+    // temporary single releaser name until a per-user Salesforce -> Sapphire mapping file exists
+    const releasedBy = required('SAPPHIRE_RELEASED_BY').trim();
+    if (!releasedBy || releasedBy.length > 20) {
+        throw new Error(
+            'SAPPHIRE_RELEASED_BY must be between 1 and 20 characters after trimming.'
+        );
+    }
+
+    return {
+        sapphireWriteConnectName: required('SAPPHIRE_WRITE_CONNECT_NAME'),
+        releasedBy: releasedBy.toLowerCase(),
+    };
+}
