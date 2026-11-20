@@ -32,7 +32,7 @@ export function getConfig() {
 }
 
 export function getReleaseConfig() {
-    // temporary single releaser name until a per-user Salesforce -> Sapphire mapping file exists
+    // Used only when a resolved Case has no Resolved_By__c value.
     const releasedBy = required('SAPPHIRE_RELEASED_BY').trim();
     if (!releasedBy || releasedBy.length > 20) {
         throw new Error(
@@ -43,5 +43,12 @@ export function getReleaseConfig() {
     return {
         sapphireWriteConnectName: required('SAPPHIRE_WRITE_CONNECT_NAME'),
         releasedBy: releasedBy.toLowerCase(),
+    };
+}
+
+/** Configuration needed exclusively by the Salesforce-to-Sapphire notes command. */
+export function getNotesConfig() {
+    return {
+        sapphireWriteConnectName: required('SAPPHIRE_WRITE_CONNECT_NAME'),
     };
 }

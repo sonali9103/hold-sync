@@ -22,10 +22,72 @@ const OUTCOMES: ReleaseOutcome[] = [
     'Rejected',
     'Error',
 ];
+const MAX_RELEASED_BY_LENGTH = 20;
 
-interface ReleaseSyncOptions {
-    onlyHoldIds: string[];
+export interface ReleaseSyncOptions {
+    onlyHoldIds?: string[];
     apply: boolean;
+    limit?: number;
+    apiDryRun?: boolean;
+}
+
+export interface ReleaseSyncSalesforceClient {
+    getResolvedCasesPendingRelease(onlyHoldIds?: string[]): Promise<ResolvedCasePendingRelease[]>;
+    recordReleaseResult(caseId: string, synced: boolean, note: string | null): Promise<void>;
+}
+
+export interface ReleaseSyncSapphireClient {
+    releaseChunk(
+        releases: SapphireRelease[],
+        dryRun: boolean
+    ): Promise<{ Results: SapphireReleaseResult[] }>;
+}
+
+export interface ReleaseSyncRunResult {
+    candidateCount: number;
+    counts: Record<ReleaseOutcome, number>;
+    failedCaseNumbers: string[];
+    dryRunRows: Array<{
+        CaseNumber: string;
+        HoldId: string;
+        ReleasedBy: string;
+        Outcome: ReleaseOutcome;
+        Message: string;
+    }>;
+    hasError: boolean;
+    errors: string[];
+}
+
+export type ReleasedByResolution =
+    | { releasedBy: string }
+    | { rejectedMessage: string };
+
+export function resolveReleasedBy(
+    caseResolvedBy: string | null,
+    fallbackReleasedBy: string
+): ReleasedByResolution {
+    const resolvedBy = caseResolvedBy?.trim();
+    if (!resolvedBy) return { releasedBy: fallbackReleasedBy };
+
+    const normalized = resolvedBy.toLowerCase();
+    if (normalized.length > MAX_RELEASED_BY_LENGTH) {
+        return {
+            rejectedMessage:
+                `Resolved_By__c is ${normalized.length} characters after trimming/lowercasing; ` +
+                `maximum is ${MAX_RELEASED_BY_LENGTH}. Hold was not released.`,
+        };
+    }
+    return { releasedBy: normalized };
+}
+
+export function groupReleasesByReleasedBy(releases: SapphireRelease[]): SapphireRelease[][] {
+    const groups = new Map<string, SapphireRelease[]>();
+    for (const release of releases) {
+        const group = groups.get(release.ReleasedBy);
+        if (group) group.push(release);
+        else groups.set(release.ReleasedBy, [release]);
+    }
+    return [...groups.values()];
 }
 
 function getOptions(): ReleaseSyncOptions {
@@ -55,6 +117,14 @@ function getOptions(): ReleaseSyncOptions {
         onlyHoldIds,
         apply: args.includes('--apply'),
     };
+}
+
+export function assertReleaseDevAllowList(onlyHoldIds: string[] | undefined): void {
+    if (REQUIRE_ONLY_HOLD_IDS && (!onlyHoldIds || onlyHoldIds.length === 0)) {
+        throw new Error(
+            '--only-hold-ids is required for --apply until existing Resolved Cases are backfilled.'
+        );
+    }
 }
 
 function createOutcomeCounts(): Record<ReleaseOutcome, number> {
@@ -103,113 +173,119 @@ function releaseNote(result: SapphireReleaseResult): string {
         : result.Outcome;
 }
 
-async function main(): Promise<void> {
-    const options = getOptions();
-    const config = getConfig();
-    const releaseConfig = getReleaseConfig();
-    const dryRun = !options.apply;
+function errorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
 
-    console.log(`Mode: ${dryRun ? 'DRY RUN' : 'APPLY'}`);
-    console.log(`Sapphire write connection: ${releaseConfig.sapphireWriteConnectName}`);
-    console.log(`ReleasedBy: ${releaseConfig.releasedBy}`);
-
-    const sf = new SalesforceHoldClient(config.salesforce);
-    await sf.login();
-
-    const pendingCases = await sf.getResolvedCasesPendingRelease(options.onlyHoldIds);
-    console.log(`Found ${pendingCases.length} Salesforce Case(s) pending Sapphire release.`);
-
+/**
+ * Injectable release workflow shared by the combined Salesforce-to-Sapphire command.
+ * The standalone command retains its stricter CLI parsing and its existing console output.
+ */
+export async function runReleaseSync(
+    options: ReleaseSyncOptions,
+    dependencies: {
+        salesforce: ReleaseSyncSalesforceClient;
+        sapphire: ReleaseSyncSapphireClient;
+        releasedBy: string;
+    }
+): Promise<ReleaseSyncRunResult> {
+    const dryRun = !options.apply || options.apiDryRun === true;
+    const pendingCases = await dependencies.salesforce.getResolvedCasesPendingRelease(options.onlyHoldIds);
+    const limitedCases = options.limit === undefined
+        ? pendingCases
+        : pendingCases.slice(0, options.limit);
     const caseByHoldId = new Map<string, ResolvedCasePendingRelease>();
-    const releases: SapphireRelease[] = pendingCases.map((pendingCase) => {
-        caseByHoldId.set(pendingCase.holdId, pendingCase);
-        return {
-            HoldId: pendingCase.holdId,
-            ReleasedBy: releaseConfig.releasedBy,
-            CaseNumber: pendingCase.caseNumber,
-        };
-    });
-
-    const client = new SapphireReleaseClient({
-        baseUrl: config.oracle.baseUrl,
-        oracleConnectName: releaseConfig.sapphireWriteConnectName,
-    });
-    const chunks = chunkReleases(releases);
+    const releaseByHoldId = new Map<string, SapphireRelease>();
     const counts = createOutcomeCounts();
     const failedCaseNumbers = new Set<string>();
-    const dryRunRows: Array<{
-        CaseNumber: string;
-        HoldId: string;
-        ReleasedBy: string;
-        Outcome: ReleaseOutcome;
-        Message: string;
-    }> = [];
-    let hasPerHoldError = false;
+    const dryRunRows: ReleaseSyncRunResult['dryRunRows'] = [];
+    const errors: string[] = [];
+    let hasError = false;
+    const releases: SapphireRelease[] = [];
 
-    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-        const chunk = chunks[chunkIndex];
-        const chunkHoldIds = new Set(chunk.map((release) => release.HoldId));
-        const chunkCases = new Map(
-            [...caseByHoldId.entries()].filter(([holdId]) => chunkHoldIds.has(holdId))
-        );
+    for (const pendingCase of limitedCases) {
+        const resolution = resolveReleasedBy(pendingCase.resolvedBy, dependencies.releasedBy);
+        if ('rejectedMessage' in resolution) {
+            counts.Rejected++;
+            failedCaseNumbers.add(pendingCase.caseNumber);
+            if (dryRun) {
+                dryRunRows.push({
+                    CaseNumber: pendingCase.caseNumber,
+                    HoldId: pendingCase.holdId,
+                    ReleasedBy: '',
+                    Outcome: 'Rejected',
+                    Message: resolution.rejectedMessage,
+                });
+            } else {
+                try {
+                    await dependencies.salesforce.recordReleaseResult(
+                        pendingCase.caseId,
+                        false,
+                        resolution.rejectedMessage
+                    );
+                } catch (err) {
+                    hasError = true;
+                    errors.push(
+                        `Could not record rejected release for hold ${pendingCase.holdId}: ${errorMessage(err)}`
+                    );
+                }
+            }
+            continue;
+        }
+        caseByHoldId.set(pendingCase.holdId, pendingCase);
+        const release = {
+            HoldId: pendingCase.holdId,
+            ReleasedBy: resolution.releasedBy,
+            CaseNumber: pendingCase.caseNumber,
+        };
+        releases.push(release);
+        releaseByHoldId.set(release.HoldId, release);
+    }
 
+    const chunks = groupReleasesByReleasedBy(releases).flatMap((group) => chunkReleases(group));
+    for (const chunk of chunks) {
         let results: SapphireReleaseResult[];
         try {
-            const response = await client.releaseChunk(chunk, dryRun);
-            results = response.Results;
+            results = (await dependencies.sapphire.releaseChunk(chunk, dryRun)).Results;
         } catch (err) {
-            for (const pendingCase of chunkCases.values()) {
-                failedCaseNumbers.add(pendingCase.caseNumber);
+            const message = errorMessage(err);
+            errors.push(`Release chunk failed for hold IDs ${chunk.map((release) => release.HoldId).join(', ')}: ${message}`);
+            for (const release of chunk) {
+                counts.Error++;
+                const pendingCase = caseByHoldId.get(release.HoldId);
+                if (pendingCase) failedCaseNumbers.add(pendingCase.caseNumber);
             }
-            const notSent = chunks.slice(chunkIndex + 1).flat();
-            console.error(
-                `Release chunk failed for hold IDs: ${chunk.map((release) => release.HoldId).join(', ')}`,
-                err
-            );
-            console.error(
-                `Holds not sent: ${notSent.length > 0
-                    ? notSent.map((release) => release.HoldId).join(', ')
-                    : '(none)'}`
-            );
-            if (dryRun) printDryRunTable(dryRunRows);
-            printSummary(counts, failedCaseNumbers, notSent);
-            throw err;
+            hasError = true;
+            break;
         }
 
         const returnedHoldIds = new Set<string>();
-        try {
-            for (const result of results) {
-                counts[result.Outcome]++;
-                returnedHoldIds.add(result.HoldId);
-                const pendingCase = chunkCases.get(result.HoldId);
+        for (const result of results) {
+            counts[result.Outcome]++;
+            returnedHoldIds.add(result.HoldId);
+            const pendingCase = caseByHoldId.get(result.HoldId);
+            if (dryRun) {
+                dryRunRows.push({
+                    CaseNumber: pendingCase?.caseNumber ?? result.CaseNumber,
+                    HoldId: result.HoldId,
+                    ReleasedBy: releaseByHoldId.get(result.HoldId)?.ReleasedBy ?? '',
+                    Outcome: result.Outcome,
+                    Message: result.Message ?? '',
+                });
+            }
+            if (!pendingCase) continue;
 
-                if (dryRun) {
-                    dryRunRows.push({
-                        CaseNumber: pendingCase?.caseNumber ?? result.CaseNumber,
-                        HoldId: result.HoldId,
-                        ReleasedBy: releaseConfig.releasedBy,
-                        Outcome: result.Outcome,
-                        Message: result.Message ?? '',
-                    });
-                }
+            if (result.Outcome === 'Error') hasError = true;
+            if (result.Outcome === 'NotFound' ||
+                result.Outcome === 'Rejected' ||
+                result.Outcome === 'Error') {
+                failedCaseNumbers.add(pendingCase.caseNumber);
+            }
 
-                if (!pendingCase) {
-                    console.warn(
-                        `Sapphire returned hold ${result.HoldId}, but it did not match a Case in this chunk.`
-                    );
-                    continue;
-                }
-
-                if (result.Outcome === 'NotFound' ||
-                    result.Outcome === 'Rejected' ||
-                    result.Outcome === 'Error') {
-                    failedCaseNumbers.add(pendingCase.caseNumber);
-                }
-                if (result.Outcome === 'Error') hasPerHoldError = true;
-
-                if (dryRun) continue;
-
+            if (dryRun) continue;
+            try {
                 if (result.Outcome === 'Released' || result.Outcome === 'AlreadyReleased') {
-                    await sf.recordReleaseResult(
+                    await dependencies.salesforce.recordReleaseResult(
                         pendingCase.caseId,
                         true,
                         releaseNote(result)
@@ -217,55 +293,73 @@ async function main(): Promise<void> {
                 } else if (result.Outcome === 'NotFound' ||
                     result.Outcome === 'Rejected' ||
                     result.Outcome === 'Error') {
-                    await sf.recordReleaseResult(
+                    await dependencies.salesforce.recordReleaseResult(
                         pendingCase.caseId,
                         false,
                         result.Message
                     );
                 }
+            } catch (err) {
+                hasError = true;
+                errors.push(`Could not record release result for hold ${result.HoldId}: ${errorMessage(err)}`);
             }
-        } catch (err) {
-            for (const pendingCase of chunkCases.values()) {
-                failedCaseNumbers.add(pendingCase.caseNumber);
-            }
-            const notSent = chunks.slice(chunkIndex + 1).flat();
-            console.error(
-                `Could not record all results for chunk hold IDs: ${chunk
-                    .map((release) => release.HoldId)
-                    .join(', ')}`,
-                err
-            );
-            console.error(
-                `Holds not sent: ${notSent.length > 0
-                    ? notSent.map((release) => release.HoldId).join(', ')
-                    : '(none)'}`
-            );
-            if (dryRun) printDryRunTable(dryRunRows);
-            printSummary(counts, failedCaseNumbers, notSent);
-            throw err;
         }
 
         for (const release of chunk) {
             if (!returnedHoldIds.has(release.HoldId)) {
-                const pendingCase = chunkCases.get(release.HoldId);
+                hasError = true;
+                counts.Error++;
+                const pendingCase = caseByHoldId.get(release.HoldId);
                 if (pendingCase) failedCaseNumbers.add(pendingCase.caseNumber);
-                console.warn(
-                    `No Sapphire result returned for Case ${release.CaseNumber}, hold ${release.HoldId}; ` +
-                    'Salesforce was left untouched.'
-                );
+                errors.push(`No Sapphire release result returned for hold ${release.HoldId}.`);
             }
         }
+        if (hasError && errors.length > 0) break;
     }
 
-    if (dryRun) printDryRunTable(dryRunRows);
-    printSummary(counts, failedCaseNumbers, []);
+    return {
+        candidateCount: limitedCases.length,
+        counts,
+        failedCaseNumbers: [...failedCaseNumbers],
+        dryRunRows,
+        hasError,
+        errors,
+    };
+}
 
-    if (hasPerHoldError) {
+async function main(): Promise<void> {
+    const options = getOptions();
+    const config = getConfig();
+    const releaseConfig = getReleaseConfig();
+    const dryRun = !options.apply || options.apiDryRun === true;
+
+    console.log(`Mode: ${dryRun ? 'DRY RUN' : 'APPLY'}`);
+    console.log(`Sapphire write connection: ${releaseConfig.sapphireWriteConnectName}`);
+
+    const salesforce = new SalesforceHoldClient(config.salesforce);
+    await salesforce.login();
+    const sapphire = new SapphireReleaseClient({
+        baseUrl: config.oracle.baseUrl,
+        oracleConnectName: releaseConfig.sapphireWriteConnectName,
+    });
+    const result = await runReleaseSync(options, {
+        salesforce,
+        sapphire,
+        releasedBy: releaseConfig.releasedBy,
+    });
+
+    console.log(`Found ${result.candidateCount} Salesforce Case(s) pending Sapphire release.`);
+    if (dryRun) printDryRunTable(result.dryRunRows);
+    printSummary(result.counts, new Set(result.failedCaseNumbers), []);
+    for (const error of result.errors) console.error(error);
+    if (result.hasError) {
         throw new Error('One or more Sapphire release results had outcome Error.');
     }
 }
 
-main().catch((err) => {
-    console.error('Release sync failed:', err);
-    process.exit(1);
-});
+if (require.main === module) {
+    main().catch((err) => {
+        console.error('Release sync failed:', err);
+        process.exit(1);
+    });
+}

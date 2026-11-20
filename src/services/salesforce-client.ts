@@ -1,10 +1,12 @@
 import jsforce = require('jsforce');
 import { HoldTicketRecord } from '../transform';
+import { normalizeNotes } from '../notes-decision';
 import { formatUtcWatermarkDate, formatWatermarkDate } from '../watermark';
 
 // Update these to match whatever API names you created in Setup.
 const CASE_OBJECT = 'Case';
-const CASE_EXTERNAL_ID_FIELD = 'Sapphire_Hold_ID__c';
+export const CASE_EXTERNAL_ID_FIELD = 'Sapphire_Hold_ID__c';
+export const CASE_SUBMISSION_ID_FIELD = 'Sapphire_Submission_ID__c';
 const CASE_RECORD_TYPE_NAME = 'CS Ticket';
 const RELEASE_STATUSES = ['Resolved'] as const;
 
@@ -12,6 +14,46 @@ export interface ResolvedCasePendingRelease {
     caseId: string;
     caseNumber: string;
     holdId: string;
+    resolvedBy: string | null;
+}
+
+export interface NotesSyncCase {
+    caseId: string;
+    caseNumber: string;
+    submissionId?: string | null;
+    description: string | null;
+    base: string | null;
+    syncedAt?: string | null;
+    status: string | null;
+    message?: string | null;
+}
+
+export interface NotesSyncCaseUpdate {
+    description?: string;
+    base?: string;
+    status?: string;
+    message?: string | null;
+    syncedAt?: Date;
+}
+
+export function hasNotesSyncCaseUpdate(update: NotesSyncCaseUpdate): boolean {
+    return update.description !== undefined ||
+        update.base !== undefined ||
+        update.status !== undefined ||
+        update.message !== undefined ||
+        update.syncedAt !== undefined;
+}
+
+export const NOTES_SYNC_REQUIRED_FIELDS = [
+    'Sapphire_Notes_Synced__c',
+    'Notes_Sync_Status__c',
+    'Notes_Sync_Message__c',
+    'Notes_Synced_At__c',
+] as const;
+
+export function findMissingNotesSyncFields(fieldNames: Iterable<string>): string[] {
+    const available = new Set(fieldNames);
+    return NOTES_SYNC_REQUIRED_FIELDS.filter((field) => !available.has(field));
 }
 
 export class SalesforceHoldClient {
@@ -160,7 +202,7 @@ export class SalesforceHoldClient {
                 .join(', ')})`
             : '';
         const soql =
-            `SELECT Id, CaseNumber, ${CASE_EXTERNAL_ID_FIELD}\n` +
+            `SELECT Id, CaseNumber, ${CASE_EXTERNAL_ID_FIELD}, Resolved_By__c\n` +
             `             FROM ${CASE_OBJECT}\n` +
             `             WHERE Status IN (${statuses})\n` +
             `             AND Hold_Source__c = 'Sapphire'\n` +
@@ -171,6 +213,7 @@ export class SalesforceHoldClient {
             Id: string;
             CaseNumber: string;
             Sapphire_Hold_ID__c: string;
+            Resolved_By__c: string | null;
         }
 
         const records: ReleaseCaseRecord[] = [];
@@ -188,6 +231,7 @@ export class SalesforceHoldClient {
             caseId: record.Id,
             caseNumber: record.CaseNumber,
             holdId: record.Sapphire_Hold_ID__c,
+            resolvedBy: record.Resolved_By__c,
         }));
     }
 
@@ -206,6 +250,102 @@ export class SalesforceHoldClient {
         }
     }
 
+    private async assertNotesSyncFieldsExist(): Promise<void> {
+        const description = await this.conn.sobject(CASE_OBJECT).describe() as unknown as {
+            fields?: Array<{ name?: string }>;
+        };
+        const fieldNames = (description.fields || [])
+            .map((field) => field.name)
+            .filter((name): name is string => typeof name === 'string');
+        const missing = findMissingNotesSyncFields(fieldNames);
+        if (missing.length > 0) {
+            throw new Error(
+                `Notes sync cannot run because these Salesforce Case fields are missing: ${missing.join(', ')}.`
+            );
+        }
+    }
+
+    async getOpenCasesForNotesSync(options: {
+        submissionId?: string;
+        limit?: number;
+    } = {}): Promise<NotesSyncCase[]> {
+        await this.assertNotesSyncFieldsExist();
+
+        const submissionFilter = options.submissionId
+            ? `\n             AND ${CASE_SUBMISSION_ID_FIELD} = '${options.submissionId.replace(/'/g, "\\'")}'`
+            : '';
+        const limit = options.limit ? `\n             LIMIT ${options.limit}` : '';
+        const soql =
+            `SELECT Id, CaseNumber, ${CASE_SUBMISSION_ID_FIELD}, Description, ` +
+            `Sapphire_Notes_Synced__c, Notes_Synced_At__c, Notes_Sync_Status__c, ` +
+            `Notes_Sync_Message__c\n` +
+            `             FROM ${CASE_OBJECT}\n` +
+            `             WHERE IsClosed = false\n` +
+            `             AND Hold_Source__c = 'Sapphire'\n` +
+            `             AND ${CASE_SUBMISSION_ID_FIELD} != null${submissionFilter}${limit}`;
+
+        interface NotesCaseRecord {
+            Id: string;
+            CaseNumber: string;
+            [CASE_SUBMISSION_ID_FIELD]: string | null;
+            Description: string | null;
+            Sapphire_Notes_Synced__c: string | null;
+            Notes_Synced_At__c: string | null;
+            Notes_Sync_Status__c: string | null;
+            Notes_Sync_Message__c: string | null;
+        }
+
+        const records: NotesCaseRecord[] = [];
+        let page = await this.conn.query<NotesCaseRecord>(soql);
+        records.push(...page.records);
+        while (!page.done) {
+            if (!page.nextRecordsUrl) {
+                throw new Error('Salesforce notes query was incomplete without a next page URL.');
+            }
+            page = await this.conn.queryMore<NotesCaseRecord>(page.nextRecordsUrl);
+            records.push(...page.records);
+        }
+
+        return records.map((record) => ({
+            caseId: record.Id,
+            caseNumber: record.CaseNumber,
+            submissionId: record[CASE_SUBMISSION_ID_FIELD],
+            description: record.Description,
+            base: record.Sapphire_Notes_Synced__c,
+            syncedAt: record.Notes_Synced_At__c,
+            status: record.Notes_Sync_Status__c,
+            message: record.Notes_Sync_Message__c,
+        }));
+    }
+
+    async updateNotesSyncCase(caseId: string, update: NotesSyncCaseUpdate): Promise<void> {
+        if (!hasNotesSyncCaseUpdate(update)) return;
+
+        const result = await this.conn.sobject(CASE_OBJECT).update({
+            Id: caseId,
+            ...(update.description === undefined ? {} : { Description: update.description }),
+            ...(update.base === undefined ? {} : { Sapphire_Notes_Synced__c: update.base }),
+            ...(update.status === undefined ? {} : { Notes_Sync_Status__c: update.status }),
+            ...(update.message === undefined ? {} : { Notes_Sync_Message__c: update.message }),
+            ...(update.syncedAt === undefined
+                ? {}
+                : { Notes_Synced_At__c: update.syncedAt.toISOString() }),
+        });
+        if (!result.success) {
+            throw new Error(`Could not update notes-sync fields for Case ${caseId}`);
+        }
+    }
+
+    async addNotesSyncComment(caseId: string, body: string): Promise<void> {
+        const result = await this.conn.sobject('CaseComment').create({
+            ParentId: caseId,
+            CommentBody: body,
+        });
+        if (!result.success) {
+            throw new Error(`Could not add notes-sync comment for Case ${caseId}`);
+        }
+    }
+
     /** Upserts one standalone Case for one Sapphire hold. */
     async upsertTicket(ticket: HoldTicketRecord): Promise<void> {
         if (!this.defaultOwnerId || !this.caseRecordTypeId) {
@@ -219,7 +359,10 @@ export class SalesforceHoldClient {
 
         const existingCase = await this.conn
             .sobject(CASE_OBJECT)
-            .findOne({ [CASE_EXTERNAL_ID_FIELD]: ticket.externalId }, ['Id', 'Status']);
+            .findOne(
+                { [CASE_EXTERNAL_ID_FIELD]: ticket.externalId },
+                ['Id', 'Status', 'Description', 'Sapphire_Notes_Synced__c']
+            );
 
         let status: 'New' | 'Resolved' | undefined;
         if (!existingCase) {
@@ -228,10 +371,16 @@ export class SalesforceHoldClient {
             status = 'Resolved';
         }
 
+        const existingBase = existingCase?.Sapphire_Notes_Synced__c as string | null | undefined;
+        const preservePendingDescription = existingCase !== null &&
+            normalizeNotes(existingBase) !== '' &&
+            normalizeNotes(existingCase.Description as string | null | undefined) !==
+                normalizeNotes(existingBase);
+
         const caseResult = await this.conn.sobject(CASE_OBJECT).upsert(
             {
                 [CASE_EXTERNAL_ID_FIELD]: ticket.externalId,
-                Sapphire_Submission_Id__c: ticket.submissionId,
+                [CASE_SUBMISSION_ID_FIELD]: ticket.submissionId,
                 Sapphire_Hold_Created_Date__c: ticket.createdDate,
                 OwnerId: this.defaultOwnerId,
                 RecordTypeId: this.caseRecordTypeId,
@@ -239,7 +388,7 @@ export class SalesforceHoldClient {
                 AccountId: accountId,
                 ContactId: contactId,
                 Subject: ticket.holdType,
-                Description: ticket.notes,
+                ...(preservePendingDescription ? {} : { Description: ticket.notes }),
                 Department__c: 'Customer Service',
                 Hold_Source__c: ticket.holdSource,
                 Account_Number__c: ticket.doctorId,
