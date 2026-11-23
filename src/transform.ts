@@ -20,6 +20,8 @@ export interface HoldTicketRecord {
   createdBy: string;
   createdDate: Date;
   isResolved: boolean;
+  /** True only when the source read sync itself observed this hold already released/closed. */
+  sourceReleaseSynced: boolean;
   resolvedBy: string | null;
   resolvedDate: Date | null;
 }
@@ -51,6 +53,8 @@ export function transformHolds(
       createdBy: row.CREATEBY,
       createdDate: row.CREATEDT,
       isResolved: row.U_OUTDATE !== null,
+      // Sapphire's source read path has not yet adopted Source_Release_Synced__c semantics.
+      sourceReleaseSynced: false,
       resolvedBy: row.U_HOLDRELEASEDBY,
       resolvedDate: row.U_OUTDATE,
     };
@@ -89,7 +93,8 @@ export function transformCopiaHolds(rows: CopiaHoldRow[]): HoldTicketRecord[] {
       createdBy: '',
       createdDate: row.createdUtc as Date,
       isResolved: row.isCancelled,
-      // Computed but currently unused: upsertTicket() omits it, as it does for Sapphire today.
+      // A cancelled Copia OrderedPanel was closed upstream. Do not send its Case back to Copia.
+      sourceReleaseSynced: row.isCancelled,
       resolvedBy: row.releasedByLastName,
       resolvedDate: row.cancelledUtc,
     };

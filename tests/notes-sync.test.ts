@@ -53,19 +53,22 @@ class FakeSalesforce implements SalesforceNotesSyncClient {
 }
 
 class FakeSapphireSource implements SapphireNotesSource {
-    readonly sinceDates: string[] = [];
+    readonly submissionIdBatches: string[][] = [];
 
     constructor(private notes: Record<string, string | null>) { }
 
-    async fetchChangedHolds(sinceDate: string): Promise<Array<{
-        U_SUBMISSIONID: string;
-        submissionNotes: string | null;
-    }>> {
-        this.sinceDates.push(sinceDate);
-        return Object.entries(this.notes).map(([U_SUBMISSIONID, submissionNotes]) => ({
-            U_SUBMISSIONID,
-            submissionNotes,
-        }));
+    async fetchSubmissionNotes(submissionIds: string[]) {
+        this.submissionIdBatches.push(submissionIds);
+        return submissionIds.flatMap((submissionId) => {
+            if (!Object.prototype.hasOwnProperty.call(this.notes, submissionId)) return [];
+            return [{
+                SUBMISSIONID: submissionId,
+                NOTES: this.notes[submissionId],
+                MODDT: null,
+                MODBY: null,
+                MODTOOL: null,
+            }];
+        });
     }
 }
 
@@ -156,6 +159,35 @@ test('never-baselined Case stays baseline and stores the timestamp marker withou
     }]);
     assert.equal(result.sapphire.calls.length, 0);
     assert.equal(result.summaries[0].outcome, 'baseline');
+});
+
+test('a null Sapphire NOTES value is distinct from a missing submission-notes row', async () => {
+    const found = await run(
+        [caseRecord('1', 'sub-1', 'Salesforce text', null)],
+        { 'sub-1': null },
+        applyOptions
+    );
+    assert.equal(found.summaries[0].outcome, 'baseline');
+    assert.deepEqual(found.salesforce.updates, [{
+        caseId: '1',
+        update: { base: '', syncedAt: new Date('2026-11-19T12:00:00.000Z') },
+    }]);
+
+    const missing = await run(
+        [caseRecord('1', 'sub-1', 'base\nSalesforce addition', 'base')],
+        {},
+        applyOptions
+    );
+    assert.equal(missing.summaries[0].outcome, 'Error');
+    assert.match(missing.summaries[0].message, /absent from the Sapphire submission-notes response/);
+    assert.deepEqual(missing.sapphire.calls, []);
+    assert.deepEqual(missing.salesforce.updates, [{
+        caseId: '1',
+        update: {
+            status: 'Error',
+            message: 'Submission was absent from the Sapphire submission-notes response.',
+        },
+    }]);
 });
 
 test('baseline fills an empty Description only when Sapphire notes differ after normalization', async () => {
@@ -563,7 +595,7 @@ test('skips a Case whose submission ID property is absent instead of grouping it
 
     assert.deepEqual(result.submissions, []);
     assert.deepEqual(result.totals, { 'Skipped: no submission ID': 1 });
-    assert.deepEqual(source.sinceDates, []);
+    assert.deepEqual(source.submissionIdBatches, []);
     assert.deepEqual(salesforce.updates, []);
     assert.ok(logs.includes('  Skipped: no submission ID: 1'));
 });

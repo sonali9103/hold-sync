@@ -29,6 +29,7 @@ const ticket: HoldTicketRecord = {
     createdBy: 'test',
     createdDate: new Date('2026-11-19T00:00:00.000Z'),
     isResolved: false,
+    sourceReleaseSynced: false,
     resolvedBy: null,
     resolvedDate: null,
 };
@@ -207,4 +208,213 @@ test('sets Description for a new Case during a hold-sync upsert', async () => {
 
     assert.equal(result.record.Description, 'Sapphire current notes');
     assert.equal(result.record[CASE_SUBMISSION_ID_FIELD], 'submission-42');
+});
+
+test('Copia read-sync writes a resolved Case with the source-release marker', async () => {
+    const setup = clientForUpsert(null);
+    await setup.client.upsertTicket({
+        ...ticket,
+        holdSource: 'Copia',
+        sourceTool: 'Copia',
+        isResolved: true,
+        sourceReleaseSynced: true,
+        resolvedBy: 'Soto',
+    });
+
+    assert.equal(setup.upserts.length, 1);
+    assert.equal(setup.upserts[0].record.Status, 'Resolved');
+    assert.equal(setup.upserts[0].record.Source_Release_Synced__c, true);
+});
+
+test('an open Copia read-sync update never clears a prior source-release marker', async () => {
+    const setup = clientForUpsert({
+        Id: 'case-1',
+        Status: 'Resolved',
+        Description: 'base',
+        Sapphire_Notes_Synced__c: 'base',
+    });
+    await setup.client.upsertTicket({
+        ...ticket,
+        holdSource: 'Copia',
+        sourceTool: 'Copia',
+        sourceReleaseSynced: false,
+    });
+
+    assert.equal('Source_Release_Synced__c' in setup.upserts[0].record, false);
+});
+
+test('Copia release candidates include only Resolved Copia Cases, never Cancelled Cases', async () => {
+    let query = '';
+    const client = new SalesforceHoldClient({
+        loginUrl: 'https://fake.example',
+        username: 'fake',
+        password: 'fake',
+        securityToken: 'fake',
+        defaultOwnerUsername: 'fake',
+    });
+    (client as unknown as {
+        conn: unknown;
+        defaultOwnerId: string;
+        caseRecordTypeId: string;
+    }).conn = {
+        query: async (soql: string) => {
+            query = soql;
+            return {
+                done: true,
+                records: [{
+                    Id: 'case-1',
+                    CaseNumber: '0001',
+                    Sapphire_Hold_ID__c: '12345678',
+                    Resolved_By__c: 'cs.user',
+                }],
+            };
+        },
+    };
+    (client as unknown as { defaultOwnerId: string }).defaultOwnerId = 'owner-1';
+    (client as unknown as { caseRecordTypeId: string }).caseRecordTypeId = 'record-type-1';
+
+    const cases = await client.getResolvedCopiaCasesPendingRelease(['12345678']);
+
+    assert.match(query, /Status = 'Resolved'/);
+    assert.equal(query.includes('Cancelled'), false);
+    assert.match(query, /Hold_Source__c = 'Copia'/);
+    assert.match(query, /Source_Release_Synced__c != true/);
+    assert.equal(query.includes('Description'), false);
+    assert.deepEqual(cases, [{
+        caseId: 'case-1',
+        caseNumber: '0001',
+        holdId: '12345678',
+        resolvedBy: 'cs.user',
+    }]);
+});
+
+test('Copia unmapped-staff lookup reads only unmarked Resolved Copia Cases', async () => {
+    let query = '';
+    const client = new SalesforceHoldClient({
+        loginUrl: 'https://fake.example',
+        username: 'fake',
+        password: 'fake',
+        securityToken: 'fake',
+        defaultOwnerUsername: 'fake',
+    });
+    (client as unknown as {
+        conn: unknown;
+        defaultOwnerId: string;
+        caseRecordTypeId: string;
+    }).conn = {
+        query: async (soql: string) => {
+            query = soql;
+            return {
+                done: true,
+                records: [
+                    { Resolved_By__c: 'Soto' },
+                    { Resolved_By__c: null },
+                ],
+            };
+        },
+    };
+    (client as unknown as { defaultOwnerId: string }).defaultOwnerId = 'owner-1';
+    (client as unknown as { caseRecordTypeId: string }).caseRecordTypeId = 'record-type-1';
+
+    const values = await client.getResolvedCopiaCaseResolvedByValues();
+
+    assert.match(query, /^SELECT Resolved_By__c/);
+    assert.match(query, /Status = 'Resolved'/);
+    assert.match(query, /Hold_Source__c = 'Copia'/);
+    assert.match(query, /Source_Release_Synced__c != true/);
+    assert.deepEqual(values, ['Soto', null]);
+});
+
+test('Copia marker-backfill source query reads only Resolved, unmarked Copia Cases', async () => {
+    let query = '';
+    const client = new SalesforceHoldClient({
+        loginUrl: 'https://fake.example',
+        username: 'fake',
+        password: 'fake',
+        securityToken: 'fake',
+        defaultOwnerUsername: 'fake',
+    });
+    (client as unknown as {
+        conn: unknown;
+        defaultOwnerId: string;
+        caseRecordTypeId: string;
+    }).conn = {
+        query: async (soql: string) => {
+            query = soql;
+            return {
+                done: true,
+                records: [{ Id: 'case-1', CaseNumber: '0001', Resolved_By__c: 'Soto' }],
+            };
+        },
+    };
+    (client as unknown as { defaultOwnerId: string }).defaultOwnerId = 'owner-1';
+    (client as unknown as { caseRecordTypeId: string }).caseRecordTypeId = 'record-type-1';
+
+    const cases = await client.getResolvedCopiaCasesMissingReleaseSync();
+
+    assert.match(query, /Status = 'Resolved'/);
+    assert.match(query, /Hold_Source__c = 'Copia'/);
+    assert.match(query, /Source_Release_Synced__c != true/);
+    assert.deepEqual(cases, [{ caseId: 'case-1', caseNumber: '0001', resolvedBy: 'Soto' }]);
+});
+
+test('records a Copia release flag and its excluded audit comment', async () => {
+    const updates: SalesforceRecord[] = [];
+    const comments: SalesforceRecord[] = [];
+    const client = new SalesforceHoldClient({
+        loginUrl: 'https://fake.example',
+        username: 'fake',
+        password: 'fake',
+        securityToken: 'fake',
+        defaultOwnerUsername: 'fake',
+    });
+    (client as unknown as { conn: unknown }).conn = {
+        sobject: (name: string) => {
+            if (name === 'Case') {
+                return { update: async (record: SalesforceRecord) => {
+                    updates.push(record);
+                    return { success: true };
+                } };
+            }
+            if (name === 'CaseComment') {
+                return { create: async (record: SalesforceRecord) => {
+                    comments.push(record);
+                    return { success: true };
+                } };
+            }
+            throw new Error(`Unexpected sObject ${name}`);
+        },
+    };
+
+    await client.recordCopiaReleaseResult('case-1', 'Updated: Copia hold cancelled.');
+
+    assert.deepEqual(updates, [{ Id: 'case-1', Source_Release_Synced__c: true }]);
+    assert.deepEqual(comments, [{
+        ParentId: 'case-1',
+        CommentBody: '[hold-sync sf-to-copia-release] Updated: Copia hold cancelled.',
+    }]);
+});
+
+test('marks a historical Copia read-sync Case without adding an audit comment', async () => {
+    const updates: SalesforceRecord[] = [];
+    const client = new SalesforceHoldClient({
+        loginUrl: 'https://fake.example',
+        username: 'fake',
+        password: 'fake',
+        securityToken: 'fake',
+        defaultOwnerUsername: 'fake',
+    });
+    (client as unknown as { conn: unknown }).conn = {
+        sobject: (name: string) => {
+            assert.equal(name, 'Case');
+            return { update: async (record: SalesforceRecord) => {
+                updates.push(record);
+                return { success: true };
+            } };
+        },
+    };
+
+    await client.markCopiaReadSyncResolved('case-1');
+
+    assert.deepEqual(updates, [{ Id: 'case-1', Source_Release_Synced__c: true }]);
 });

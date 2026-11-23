@@ -6,6 +6,9 @@
  * only makes HTTP requests to its supported endpoints.
  */
 
+export const ORACLE_REQUEST_TIMEOUT_MS = 60000;
+export const SUBMISSION_NOTES_CHUNK_SIZE = 250;
+
 export interface HoldRow {
     U_DDIHOLDLISTID: string;
     U_SUBMISSIONID: string;
@@ -33,6 +36,15 @@ export interface SubmissionContactInfo {
     patientName: string | null;
     patientPhone: string | null;
     patientId: string | null;
+}
+
+/** Raw SUBMISSION values used as the Sapphire side of notes synchronization. */
+export interface SubmissionNotesRow {
+    SUBMISSIONID: string | null;
+    NOTES: string | null;
+    MODDT: Date | null;
+    MODBY: string | null;
+    MODTOOL: string | null;
 }
 
 interface ApiErrorMessage {
@@ -80,6 +92,38 @@ interface ContactInfoResponse extends ApiResponse {
     }>;
 }
 
+interface SubmissionNotesResponse extends ApiResponse {
+    SubmissionNotes: Array<{
+        SUBMISSIONID: string | null;
+        NOTES: string | null;
+        MODDT: string | null;
+        MODBY: string | null;
+        MODTOOL: string | null;
+    }>;
+}
+
+/** Removes blank IDs and preserves the first exact trimmed spelling of each ID. */
+export function uniqueTrimmedSubmissionIds(submissionIds: string[]): string[] {
+    const uniqueIds: string[] = [];
+    const seen = new Set<string>();
+    for (const submissionId of submissionIds) {
+        const trimmed = submissionId.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        uniqueIds.push(trimmed);
+    }
+    return uniqueIds;
+}
+
+export function chunkSubmissionIds(submissionIds: string[]): string[][] {
+    const chunks: string[][] = [];
+    const uniqueIds = uniqueTrimmedSubmissionIds(submissionIds);
+    for (let index = 0; index < uniqueIds.length; index += SUBMISSION_NOTES_CHUNK_SIZE) {
+        chunks.push(uniqueIds.slice(index, index + SUBMISSION_NOTES_CHUNK_SIZE));
+    }
+    return chunks;
+}
+
 export class OracleHoldClient {
     constructor(
         private config: {
@@ -95,14 +139,21 @@ export class OracleHoldClient {
     private async post<T extends ApiResponse>(endpoint: string, body: unknown): Promise<T> {
         const baseUrl = this.config.baseUrl.replace(/\/+$/, '');
         const connectName = encodeURIComponent(this.config.oracleConnectName);
-        const response = await fetch(
-            `${baseUrl}/api/DDILibrary/${endpoint}?oracleConnectName=${connectName}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            }
-        );
+        let response: Response;
+        try {
+            response = await fetch(
+                `${baseUrl}/api/DDILibrary/${endpoint}?oracleConnectName=${connectName}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(ORACLE_REQUEST_TIMEOUT_MS),
+                }
+            );
+        } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            throw new Error(`DDIVbNetApis request failed: ${detail}`);
+        }
 
         let result: T;
         try {
@@ -172,6 +223,25 @@ export class OracleHoldClient {
             sSubmissionId: submissionId,
         });
         return response.Holds.map((row) => this.parseHoldRow(row));
+    }
+
+    /** Current raw notes and audit values for the requested Sapphire submissions. */
+    async fetchSubmissionNotes(submissionIds: string[]): Promise<SubmissionNotesRow[]> {
+        const rows: SubmissionNotesRow[] = [];
+        for (const chunk of chunkSubmissionIds(submissionIds)) {
+            const response = await this.post<SubmissionNotesResponse>(
+                'Sapphire_GetSubmissionNotes',
+                { SubmissionIds: chunk }
+            );
+            rows.push(...response.SubmissionNotes.map((row) => ({
+                SUBMISSIONID: row.SUBMISSIONID,
+                NOTES: row.NOTES,
+                MODDT: row.MODDT ? new Date(row.MODDT) : null,
+                MODBY: row.MODBY,
+                MODTOOL: row.MODTOOL,
+            })));
+        }
+        return rows;
     }
 
     /** Contact join key -- SUBMISSION.U_SUBACCOUNTID per submission. */

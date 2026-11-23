@@ -17,6 +17,21 @@ export interface ResolvedCasePendingRelease {
     resolvedBy: string | null;
 }
 
+/** A resolved Copia Case that has not yet been sent back to Copia. */
+export interface ResolvedCopiaCasePendingRelease {
+    caseId: string;
+    caseNumber: string;
+    holdId: string;
+    resolvedBy: string | null;
+}
+
+/** A historical Copia Case that still needs the read-sync marker backfilled. */
+export interface ResolvedCopiaCaseMissingReleaseSync {
+    caseId: string;
+    caseNumber: string;
+    resolvedBy: string | null;
+}
+
 export interface NotesSyncCase {
     caseId: string;
     caseNumber: string;
@@ -235,6 +250,138 @@ export class SalesforceHoldClient {
         }));
     }
 
+    /**
+     * Copia release candidates deliberately query only Resolved Cases.  In particular, a Case
+     * moved to Cancelled by the separate Cancelled Letter process is never eligible here.
+     */
+    async getResolvedCopiaCasesPendingRelease(
+        onlyHoldIds?: string[]
+    ): Promise<ResolvedCopiaCasePendingRelease[]> {
+        if (!this.defaultOwnerId || !this.caseRecordTypeId) {
+            throw new Error(
+                'Not logged in — call login() before getResolvedCopiaCasesPendingRelease()'
+            );
+        }
+
+        if (onlyHoldIds?.length === 0) return [];
+        for (const holdId of onlyHoldIds ?? []) {
+            if (!/^\d{8}$/.test(holdId)) {
+                throw new Error(`Invalid Copia hold ID: ${holdId}`);
+            }
+        }
+
+        const holdIdFilter = onlyHoldIds
+            ? `\n             AND ${CASE_EXTERNAL_ID_FIELD} IN (${onlyHoldIds
+                .map((holdId) => `'${holdId}'`)
+                .join(', ')})`
+            : '';
+        const soql =
+            `SELECT Id, CaseNumber, ${CASE_EXTERNAL_ID_FIELD}, Resolved_By__c\n` +
+            `             FROM ${CASE_OBJECT}\n` +
+            `             WHERE Status = 'Resolved'\n` +
+            `             AND Hold_Source__c = 'Copia'\n` +
+            `             AND ${CASE_EXTERNAL_ID_FIELD} != null\n` +
+            `             AND Source_Release_Synced__c != true${holdIdFilter}`;
+
+        interface CopiaReleaseCaseRecord {
+            Id: string;
+            CaseNumber: string;
+            Sapphire_Hold_ID__c: string;
+            Resolved_By__c: string | null;
+        }
+
+        const records: CopiaReleaseCaseRecord[] = [];
+        let page = await this.conn.query<CopiaReleaseCaseRecord>(soql);
+        records.push(...page.records);
+        while (!page.done) {
+            if (!page.nextRecordsUrl) {
+                throw new Error('Salesforce Copia release query was incomplete without a next page URL.');
+            }
+            page = await this.conn.queryMore<CopiaReleaseCaseRecord>(page.nextRecordsUrl);
+            records.push(...page.records);
+        }
+
+        return records.map((record) => ({
+            caseId: record.Id,
+            caseNumber: record.CaseNumber,
+            holdId: record.Sapphire_Hold_ID__c,
+            resolvedBy: record.Resolved_By__c,
+        }));
+    }
+
+    /**
+     * Read-only helper for maintaining copia-staff-map.json. Once cancelled Copia Cases have the
+     * marker, these are exactly the remaining possible Salesforce-to-Copia release candidates.
+     */
+    async getResolvedCopiaCaseResolvedByValues(): Promise<Array<string | null>> {
+        if (!this.defaultOwnerId || !this.caseRecordTypeId) {
+            throw new Error(
+                'Not logged in — call login() before getResolvedCopiaCaseResolvedByValues()'
+            );
+        }
+
+        interface CopiaResolvedByRecord {
+            Resolved_By__c: string | null;
+        }
+
+        const records: CopiaResolvedByRecord[] = [];
+        let page = await this.conn.query<CopiaResolvedByRecord>(
+            `SELECT Resolved_By__c\n` +
+            `             FROM ${CASE_OBJECT}\n` +
+            `             WHERE Status = 'Resolved'\n` +
+            `             AND Hold_Source__c = 'Copia'\n` +
+            `             AND Source_Release_Synced__c != true`
+        );
+        records.push(...page.records);
+        while (!page.done) {
+            if (!page.nextRecordsUrl) {
+                throw new Error('Salesforce Copia resolved-by query was incomplete without a next page URL.');
+            }
+            page = await this.conn.queryMore<CopiaResolvedByRecord>(page.nextRecordsUrl);
+            records.push(...page.records);
+        }
+
+        return records.map((record) => record.Resolved_By__c);
+    }
+
+    /** Read-only source for the bounded historical Copia read-sync marker backfill. */
+    async getResolvedCopiaCasesMissingReleaseSync(): Promise<ResolvedCopiaCaseMissingReleaseSync[]> {
+        if (!this.defaultOwnerId || !this.caseRecordTypeId) {
+            throw new Error(
+                'Not logged in — call login() before getResolvedCopiaCasesMissingReleaseSync()'
+            );
+        }
+
+        interface CopiaBackfillCaseRecord {
+            Id: string;
+            CaseNumber: string;
+            Resolved_By__c: string | null;
+        }
+
+        const records: CopiaBackfillCaseRecord[] = [];
+        let page = await this.conn.query<CopiaBackfillCaseRecord>(
+            `SELECT Id, CaseNumber, Resolved_By__c\n` +
+            `             FROM ${CASE_OBJECT}\n` +
+            `             WHERE Status = 'Resolved'\n` +
+            `             AND Hold_Source__c = 'Copia'\n` +
+            `             AND Source_Release_Synced__c != true`
+        );
+        records.push(...page.records);
+        while (!page.done) {
+            if (!page.nextRecordsUrl) {
+                throw new Error('Salesforce Copia backfill query was incomplete without a next page URL.');
+            }
+            page = await this.conn.queryMore<CopiaBackfillCaseRecord>(page.nextRecordsUrl);
+            records.push(...page.records);
+        }
+
+        return records.map((record) => ({
+            caseId: record.Id,
+            caseNumber: record.CaseNumber,
+            resolvedBy: record.Resolved_By__c,
+        }));
+    }
+
     async recordReleaseResult(
         caseId: string,
         synced: boolean,
@@ -247,6 +394,39 @@ export class SalesforceHoldClient {
         });
         if (!result.success) {
             throw new Error(`Could not record Sapphire release result for Case ${caseId}`);
+        }
+    }
+
+    /**
+     * The comment has a stable machine prefix so a future Salesforce-comment sync can exclude
+     * this audit event instead of sending it back to Copia as customer-service commentary.
+     */
+    async recordCopiaReleaseResult(caseId: string, note: string): Promise<void> {
+        const update = await this.conn.sobject(CASE_OBJECT).update({
+            Id: caseId,
+            Source_Release_Synced__c: true,
+        });
+        if (!update.success) {
+            throw new Error(`Could not mark Copia release synced for Case ${caseId}`);
+        }
+
+        const comment = await this.conn.sobject('CaseComment').create({
+            ParentId: caseId,
+            CommentBody: `[hold-sync sf-to-copia-release] ${note}`,
+        });
+        if (!comment.success) {
+            throw new Error(`Could not add Copia release audit comment for Case ${caseId}`);
+        }
+    }
+
+    /** Marks a Case which the Copia read sync had already observed as cancelled upstream. */
+    async markCopiaReadSyncResolved(caseId: string): Promise<void> {
+        const update = await this.conn.sobject(CASE_OBJECT).update({
+            Id: caseId,
+            Source_Release_Synced__c: true,
+        });
+        if (!update.success) {
+            throw new Error(`Could not mark Copia read-sync Case ${caseId} release synced`);
         }
     }
 
@@ -385,6 +565,9 @@ export class SalesforceHoldClient {
                 OwnerId: this.defaultOwnerId,
                 RecordTypeId: this.caseRecordTypeId,
                 ...(status ? { Status: status } : {}),
+                // An upstream Copia cancellation must never become a Salesforce-to-Copia release
+                // candidate. Deliberately omit false so a prior true marker is never cleared.
+                ...(ticket.sourceReleaseSynced ? { Source_Release_Synced__c: true } : {}),
                 AccountId: accountId,
                 ContactId: contactId,
                 Subject: ticket.holdType,

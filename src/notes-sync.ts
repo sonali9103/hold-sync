@@ -17,12 +17,7 @@ import {
     SapphireNotesResult,
     SapphireNotesUpdate,
 } from './services/sapphire-notes-client';
-import { OracleHoldClient } from './services/oracle-client';
-
-// Sapphire exposes SUBMISSION.NOTES through Sapphire_GetChangedHolds, which needs a
-// since date but has no direct submission-notes lookup endpoint. This is the broad
-// date already used by scripts/check-oracle-connection.ts.
-export const NOTES_SYNC_CHANGED_HOLDS_SINCE = '01-JAN-2020';
+import { OracleHoldClient, SubmissionNotesRow } from './services/oracle-client';
 
 export const NOTES_SYNC_USAGE = [
     'Usage: notes-sync [--dry-run|--apply] [--api-dry-run] [--submission <id>|--all-local] [--limit <n>]',
@@ -44,10 +39,7 @@ export interface NotesSyncOptions {
 }
 
 export interface SapphireNotesSource {
-    fetchChangedHolds(sinceDate: string): Promise<Array<{
-        U_SUBMISSIONID: string;
-        submissionNotes: string | null;
-    }>>;
+    fetchSubmissionNotes(submissionIds: string[]): Promise<SubmissionNotesRow[]>;
 }
 
 export interface SalesforceNotesSyncClient {
@@ -561,36 +553,27 @@ export async function runNotesSync(
         limit: options.limit,
     })).map(loadNotesSyncCase);
     const { groups, skippedNoSubmissionId } = groupBySubmission(cases);
-    const changedHolds = groups.size === 0
+    const submissionNotes = groups.size === 0
         ? []
-        : await dependencies.sapphireSource.fetchChangedHolds(NOTES_SYNC_CHANGED_HOLDS_SINCE);
+        : await dependencies.sapphireSource.fetchSubmissionNotes([...groups.keys()]);
     const sapphireNotesBySubmission = new Map<string, string | null>();
-    const sourceErrors = new Map<string, string>();
 
-    for (const hold of changedHolds) {
-        if (!groups.has(hold.U_SUBMISSIONID)) continue;
-        if (sapphireNotesBySubmission.has(hold.U_SUBMISSIONID) &&
-            sapphireNotesBySubmission.get(hold.U_SUBMISSIONID) !== hold.submissionNotes) {
-            sourceErrors.set(
-                hold.U_SUBMISSIONID,
-                'Sapphire changed-holds response returned inconsistent SubmissionNotes.'
-            );
-            continue;
-        }
-        sapphireNotesBySubmission.set(hold.U_SUBMISSIONID, hold.submissionNotes);
+    for (const submission of submissionNotes) {
+        const submissionId = submission.SUBMISSIONID?.trim();
+        if (!submissionId || !groups.has(submissionId)) continue;
+        sapphireNotesBySubmission.set(submissionId, submission.NOTES);
     }
 
     const plans: SubmissionPlan[] = [];
     for (const [submissionId, siblings] of groups) {
-        const sourceError = sourceErrors.get(submissionId);
-        if (sourceError || !sapphireNotesBySubmission.has(submissionId)) {
+        if (!sapphireNotesBySubmission.has(submissionId)) {
             plans.push({
                 submissionId,
                 cases: siblings,
                 decisions: [],
                 action: 'status',
                 summaryOutcome: 'Error',
-                message: sourceError || 'Submission was absent from the Sapphire changed-holds response.',
+                message: 'Submission was absent from the Sapphire submission-notes response.',
                 status: 'Error',
             });
         } else {
